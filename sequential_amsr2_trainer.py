@@ -5,8 +5,18 @@ AMSR2 Sequential Trainer - Memory Protected Edition
 Обучение происходит файл за файлом, без предварительной загрузки всех данных
 
 Автор: Volodymyr Didur
-Версия: 4.0 - Sequential Processing Edition
+Версия: 4.1 - CPU Optimized Sequential Processing Edition
 """
+
+# ====== ОГРАНИЧЕНИЕ ИСПОЛЬЗОВАНИЯ CPU (КРИТИЧЕСКИ ВАЖНО!) ======
+# Устанавливаем переменные окружения ДО импорта библиотек
+import os
+
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '4'
+os.environ['NUMEXPR_NUM_THREADS'] = '4'
 
 import torch
 import torch.nn as nn
@@ -14,7 +24,6 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import os
 import glob
 from typing import Tuple, List, Optional, Dict
 import matplotlib.pyplot as plt
@@ -34,10 +43,23 @@ import warnings
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
+# Ограничиваем количество потоков PyTorch
+torch.set_num_threads(4)
+torch.set_num_interop_threads(2)
+
+# Отключаем MKL если используется
+try:
+    import mkl
+
+    mkl.set_num_threads(4)
+except:
+    pass
+
 # ====== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======
 EMERGENCY_STOP = False
 MEMORY_THRESHOLD = 80.0
 MONITOR_INTERVAL = 6
+CPU_THRESHOLD = 85.0
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
 logging.basicConfig(
@@ -55,12 +77,14 @@ logger = logging.getLogger(__name__)
 class MemoryMonitor:
     """Усиленный мониторинг памяти с более строгими проверками"""
 
-    def __init__(self, threshold=70.0):  # Понижено до 70%
+    def __init__(self, threshold=70.0):
         self.threshold = threshold
         self.monitoring = False
         self.monitor_thread = None
         self.check_count = 0
         self.critical_warnings = 0
+        self.monitor_interval = MONITOR_INTERVAL  # ИСПРАВЛЕНО: добавлен атрибут
+        self.stats_history = []
 
     def check_memory(self):
         """Проверка текущего состояния памяти с расширенной диагностикой"""
@@ -150,6 +174,14 @@ class MemoryMonitor:
                 memory_info = self.check_memory()
                 cpu_percent = psutil.cpu_percent(interval=1)
 
+                # Сохраняем статистику
+                self.stats_history.append({
+                    'timestamp': time.time(),
+                    'memory_percent': memory_info['percent'],
+                    'cpu_percent': cpu_percent,
+                    'swap_percent': memory_info['swap_percent']
+                })
+
                 # Детальное логирование каждые 10 проверок
                 if self.check_count % 10 == 0:
                     logger.info(f"📊 Система - RAM: {memory_info['percent']:.1f}%, "
@@ -199,6 +231,23 @@ class MemoryMonitor:
         self.monitoring = False
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
+
+    def get_stats_summary(self):
+        """Получение сводки статистики"""
+        if not self.stats_history:
+            return None
+
+        memory_percents = [s['memory_percent'] for s in self.stats_history]
+        cpu_percents = [s['cpu_percent'] for s in self.stats_history]
+
+        return {
+            'avg_memory_percent': np.mean(memory_percents),
+            'max_memory_percent': np.max(memory_percents),
+            'min_available_memory_gb': (100 - np.max(
+                memory_percents)) * psutil.virtual_memory().total / 100 / 1024 ** 3,
+            'avg_cpu_percent': np.mean(cpu_percents),
+            'max_cpu_percent': np.max(cpu_percents)
+        }
 
 
 memory_monitor = MemoryMonitor(MEMORY_THRESHOLD)
@@ -942,7 +991,7 @@ def plot_training_progress(training_history: List[Dict], save_path: str = "train
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.close()
 
     logger.info(f"📈 График сохранен: {save_path}")
 
@@ -1011,6 +1060,13 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"🖥️ Используется устройство: {device}")
 
+    # Оптимизации для CPU
+    if not torch.cuda.is_available():
+        logger.info("🔧 Применяем оптимизации для CPU...")
+        torch.backends.mkldnn.enabled = True
+        torch.backends.openmp.enabled = True
+        logger.info(f"   Количество потоков PyTorch: {torch.get_num_threads()}")
+
     # Проверка памяти с более строгими требованиями
     memory_info = psutil.virtual_memory()
     logger.info(
@@ -1068,11 +1124,16 @@ def main():
 
         # Создание модели
         logger.info("🧠 Создание модели...")
+        logger.info(f"   Количество CPU: {os.cpu_count()}")
+        logger.info(f"   Ограничение потоков: {torch.get_num_threads()}")
+
         model = UNetResNetSuperResolution(
             in_channels=1,
             out_channels=1,
             scale_factor=args.scale_factor
         )
+
+        logger.info("   Модель создана успешно")
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"   Параметров в модели: {total_params:,}")
@@ -1080,8 +1141,8 @@ def main():
 
         # Создание preprocessor
         preprocessor = AMSR2NPZDataPreprocessor(
-            target_height=args.target_size,
-            target_width=args.target_size
+            target_height=args.target_height,  # ИСПРАВЛЕНО
+            target_width=args.target_width  # ИСПРАВЛЕНО
         )
 
         # Создание тренера

@@ -286,11 +286,11 @@ def main():
     # Дополнительные проверки безопасности
     memory_gb = psutil.virtual_memory().available / 1024 ** 3
     if memory_gb < 8 and final_params['batch_size'] > 1:
-        logger.warning(f"⚠️ При {memory_gb:.1f}GB памяти снижаем batch_size до 1")
+        print(f"⚠️ При {memory_gb:.1f}GB памяти снижаем batch_size до 1")  # ИСПРАВЛЕНО
         final_params['batch_size'] = 1
 
     if analysis['total_size_gb'] > 30 and final_params['max_files'] > 10:
-        logger.warning(f"⚠️ При {analysis['total_size_gb']:.1f}GB данных ограничиваем файлы до 10")
+        print(f"⚠️ При {analysis['total_size_gb']:.1f}GB данных ограничиваем файлы до 10")  # ИСПРАВЛЕНО
         final_params['max_files'] = 10
 
     # Оценка времени
