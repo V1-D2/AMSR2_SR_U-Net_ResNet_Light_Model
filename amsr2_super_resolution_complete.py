@@ -258,51 +258,105 @@ class AMSR2NPZDataPreprocessor:
 class AMSR2NPZDataset(Dataset):
     """Dataset для AMSR2 NPZ данных с множественными swath"""
 
-    def __init__(self, npz_paths: List[str], preprocessor: AMSR2NPZDataPreprocessor,
-                 degradation_scale: int = 4, augment: bool = True,
-                 filter_orbit_type: Optional[str] = None):
+    class AMSR2NPZDataset(Dataset):
+        """Dataset для AMSR2 NPZ данных с множественными swath"""
 
-        self.npz_paths = npz_paths
-        self.preprocessor = preprocessor
-        self.degradation_scale = degradation_scale
-        self.augment = augment
-        self.filter_orbit_type = filter_orbit_type
+        def __init__(self, npz_paths: List[str], preprocessor: AMSR2NPZDataPreprocessor,
+                     degradation_scale: int = 4, augment: bool = True,
+                     filter_orbit_type: Optional[str] = None):
 
-        # Предварительно загружаем все swath для создания индекса
-        self.swath_index = []
+    # ... old implementation that pre-loads all data ...
 
-        logger.info("Индексирование swath данных...")
+    # WITH THIS NEW IMPLEMENTATION:
+    class AMSR2NPZDataset(Dataset):
+        """Memory-efficient dataset that loads data on-demand"""
 
-        for npz_path in tqdm(npz_paths, desc="Загрузка NPZ файлов"):
-            swath_list = preprocessor.load_swath_from_npz(npz_path)
+        def __init__(self, npz_paths: List[str], preprocessor: AMSR2NPZDataPreprocessor,
+                     degradation_scale: int = 4, augment: bool = True,
+                     filter_orbit_type: Optional[str] = None):
 
-            for swath_idx, swath in enumerate(swath_list):
-                # Фильтрация по типу орбиты если требуется
-                if filter_orbit_type is not None:
-                    orbit_type = swath['metadata'].get('orbit_type', 'U')
-                    if orbit_type != filter_orbit_type:
-                        continue
+            self.npz_paths = npz_paths
+            self.preprocessor = preprocessor
+            self.degradation_scale = degradation_scale
+            self.augment = augment
+            self.filter_orbit_type = filter_orbit_type
 
-                # Проверяем валидность данных
-                temp = swath['temperature']
-                valid_pixels = np.sum(~np.isnan(temp))
-                total_pixels = temp.size
+            # Only create an index, don't load data
+            self.swath_index = []
 
-                if valid_pixels / total_pixels > 0.1:  # Минимум 10% валидных пикселей
-                    self.swath_index.append({
-                        'npz_path': npz_path,
-                        'swath_idx': swath_idx,
-                        'swath_data': swath
-                    })
+            logger.info("Creating dataset index...")
 
-        logger.info(f"Найдено {len(self.swath_index)} валидных swath")
+            for npz_idx, npz_path in enumerate(tqdm(npz_paths, desc="Indexing NPZ files")):
+                # Quick scan to count valid swaths without loading data
+                try:
+                    with np.load(npz_path, allow_pickle=True) as data:
+                        swath_array = data['swath_array']
 
-        # Анализируем размеры если еще не было
-        if not hasattr(preprocessor, 'target_height') or preprocessor.target_height is None:
-            self.preprocessor.analyze_npz_files(npz_paths)
+                        for swath_idx in range(len(swath_array)):
+                            self.swath_index.append({
+                                'npz_idx': npz_idx,
+                                'npz_path': npz_path,
+                                'swath_idx': swath_idx
+                            })
+                except Exception as e:
+                    logger.error(f"Error indexing {npz_path}: {e}")
 
-    def __len__(self):
-        return len(self.swath_index)
+            logger.info(f"Dataset initialized with {len(self.swath_index)} swaths")
+
+        def __len__(self):
+            return len(self.swath_index)
+
+        def __getitem__(self, idx):
+            # Load data only when needed
+            swath_info = self.swath_index[idx]
+
+            try:
+                with np.load(swath_info['npz_path'], allow_pickle=True) as data:
+                    swath_array = data['swath_array']
+                    swath_dict = swath_array[swath_info['swath_idx']]
+                    swath = swath_dict.item() if isinstance(swath_dict, np.ndarray) else swath_dict
+
+                    # Process the swath
+                    temperature = swath['temperature'].copy()
+                    metadata = swath['metadata']
+
+                    # Apply scale factor
+                    scale_factor = metadata.get('scale_factor', 1.0)
+                    if temperature.dtype != np.float32:
+                        temperature = temperature.astype(np.float32) * scale_factor
+
+                    # Filter invalid values
+                    temperature = np.where(temperature < 50, np.nan, temperature)
+                    temperature = np.where(temperature > 350, np.nan, temperature)
+
+                    # Check validity
+                    valid_pixels = np.sum(~np.isnan(temperature))
+                    total_pixels = temperature.size
+
+                    if valid_pixels / total_pixels < 0.1:
+                        # Return zeros if too many invalid pixels
+                        empty = torch.zeros(1, self.preprocessor.target_height, self.preprocessor.target_width)
+                        return empty, empty
+
+                    # Process temperature
+                    temperature = self.preprocessor.crop_and_pad_to_target(temperature)
+                    temperature = self.preprocessor.normalize_brightness_temperature(temperature)
+
+                    if self.augment:
+                        temperature = self.augment_data(temperature)
+
+                    # Create degradation
+                    degraded = self.create_degradation(temperature)
+
+                    high_res = torch.from_numpy(temperature).unsqueeze(0).float()
+                    low_res = torch.from_numpy(degraded).unsqueeze(0).float()
+
+                    return low_res, high_res
+
+            except Exception as e:
+                logger.error(f"Error loading swath {idx}: {e}")
+                empty = torch.zeros(1, self.preprocessor.target_height, self.preprocessor.target_width)
+                return empty, empty
 
     def create_degradation(self, high_res: np.ndarray) -> np.ndarray:
         """Создание деградированной версии для self-supervised обучения"""
@@ -688,13 +742,19 @@ class SuperResolutionMetrics:
 # SECTION 4: TRAINING INFRASTRUCTURE
 # ================================================================================================
 
+
+# MODIFY the __init__ method:
 class AMSR2SuperResolutionTrainer:
     """Тренер для обучения модели super-resolution"""
 
     def __init__(self, model: nn.Module, device: torch.device,
-                 learning_rate: float = 1e-4, weight_decay: float = 1e-5):
+                 learning_rate: float = 1e-4, weight_decay: float = 1e-5,
+                 gradient_accumulation_steps: int = 4, use_amp: bool = True):  # ADD THESE PARAMETERS
+
         self.model = model.to(device)
         self.device = device
+        self.gradient_accumulation_steps = gradient_accumulation_steps  # ADD THIS
+        self.use_amp = use_amp and device.type == 'cuda'  # ADD THIS
 
         # Оптимизатор и scheduler
         self.optimizer = torch.optim.AdamW(
@@ -705,6 +765,9 @@ class AMSR2SuperResolutionTrainer:
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
         )
+
+        # Mixed precision training - ADD THIS
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
 
         # Loss функция и метрики
         self.criterion = AMSR2SpecificLoss()
@@ -720,93 +783,77 @@ class AMSR2SuperResolutionTrainer:
         self.best_val_loss = float('inf')
         self.best_model_state = None
 
+    # REPLACE the entire train_epoch method:
     def train_epoch(self, train_loader: DataLoader) -> dict:
-        """Обучение на одной эпохе с мониторингом CPU"""
+        """Training with gradient accumulation and mixed precision"""
         self.model.train()
         epoch_losses = []
         self.metrics.reset()
 
-        # CPU мониторинг для отслеживания эффективности
-        cpu_monitoring = self.device.type == 'cpu'
-        if cpu_monitoring:
-            try:
-                import psutil
-                cpu_percent_start = psutil.cpu_percent()
-                memory_start = psutil.virtual_memory().percent
-                process = psutil.Process()
-                start_threads = process.num_threads()
-                logger.info(
-                    f"🔧 Начало эпохи - CPU: {cpu_percent_start:.1f}%, RAM: {memory_start:.1f}%, Threads: {start_threads}")
-            except ImportError:
-                cpu_monitoring = False
-                logger.warning("psutil не установлен - мониторинг CPU недоступен")
+        # Clear gradients at start
+        self.optimizer.zero_grad()
 
-        progress_bar = tqdm(train_loader, desc="Обучение")
+        progress_bar = tqdm(train_loader, desc="Training")
 
         for batch_idx, (low_res, high_res) in enumerate(progress_bar):
             low_res = low_res.to(self.device)
             high_res = high_res.to(self.device)
 
-            # Forward pass
-            self.optimizer.zero_grad()
-            pred = self.model(low_res)
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                pred = self.model(low_res)
+                loss, loss_components = self.criterion(pred, high_res)
 
-            # Вычисление loss
-            loss, loss_components = self.criterion(pred, high_res)
+                # Scale loss by gradient accumulation steps
+                loss = loss / self.gradient_accumulation_steps
 
             # Backward pass
-            loss.backward()
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-            # Gradient clipping для стабильности
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Update weights every gradient_accumulation_steps
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
 
-            self.optimizer.step()
+                self.optimizer.zero_grad()
 
-            # Статистика
-            epoch_losses.append(loss.item())
-            self.metrics.update(pred, high_res)
+            # Statistics (unscaled loss)
+            actual_loss = loss.item() * self.gradient_accumulation_steps
+            epoch_losses.append(actual_loss)
+            self.metrics.update(pred.detach(), high_res)
 
-            # Обновление progress bar с расширенной информацией
+            # Update progress bar
             if batch_idx % 10 == 0:
                 current_metrics = self.metrics.get_metrics()
-                postfix = {
-                    'Loss': f"{loss.item():.4f}",
+                progress_bar.set_postfix({
+                    'Loss': f"{actual_loss:.4f}",
                     'PSNR': f"{current_metrics.get('PSNR', 0):.2f}",
                     'SSIM': f"{current_metrics.get('SSIM', 0):.3f}"
-                }
+                })
 
-                # Добавляем CPU статистику каждые 50 батчей для мониторинга
-                if cpu_monitoring and batch_idx % 50 == 0:
-                    try:
-                        cpu_usage = psutil.cpu_percent(interval=0.1)
-                        memory_usage = psutil.virtual_memory().percent
-                        process_threads = process.num_threads()
+            # Clear cache periodically to prevent memory fragmentation
+            if batch_idx % 50 == 0 and self.device.type == 'cuda':
+                torch.cuda.empty_cache()
 
-                        # Добавляем в progress bar только ключевые метрики
-                        postfix['CPU'] = f"{cpu_usage:.0f}%"
-                        postfix['RAM'] = f"{memory_usage:.0f}%"
+        # Handle any remaining gradients
+        if len(train_loader) % self.gradient_accumulation_steps != 0:
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.optimizer.zero_grad()
 
-                        # Детальный лог каждые 100 батчей
-                        if batch_idx % 100 == 0:
-                            logger.info(
-                                f"Batch {batch_idx}: CPU {cpu_usage:.1f}%, RAM {memory_usage:.1f}%, Threads {process_threads}")
-                    except:
-                        pass  # Игнорируем ошибки мониторинга
-
-                progress_bar.set_postfix(postfix)
-
-        # Финальная статистика эпохи
-        if cpu_monitoring:
-            try:
-                cpu_percent_end = psutil.cpu_percent()
-                memory_end = psutil.virtual_memory().percent
-                end_threads = process.num_threads()
-                logger.info(
-                    f"🏁 Конец эпохи - CPU: {cpu_percent_end:.1f}%, RAM: {memory_end:.1f}%, Threads: {end_threads}")
-            except:
-                pass
-
-        # Средние метрики за эпоху
+        # Average metrics
         epoch_metrics = self.metrics.get_metrics()
         avg_loss = np.mean(epoch_losses)
 
@@ -816,6 +863,7 @@ class AMSR2SuperResolutionTrainer:
             'loss_components': loss_components
         }
 
+    # MODIFY the validate_epoch method to add mixed precision:
     def validate_epoch(self, val_loader: DataLoader) -> dict:
         """Валидация на одной эпохе"""
         self.model.eval()
@@ -827,9 +875,10 @@ class AMSR2SuperResolutionTrainer:
                 low_res = low_res.to(self.device)
                 high_res = high_res.to(self.device)
 
-                # Forward pass
-                pred = self.model(low_res)
-                loss, loss_components = self.criterion(pred, high_res)
+                # Forward pass with mixed precision
+                with torch.cuda.amp.autocast(enabled=self.use_amp):  # ADD THIS
+                    pred = self.model(low_res)
+                    loss, loss_components = self.criterion(pred, high_res)
 
                 epoch_losses.append(loss.item())
                 self.metrics.update(pred, high_res)
@@ -982,21 +1031,23 @@ class AMSR2SuperResolutionTrainer:
 # SECTION 5: DATA LOADING AND UTILITIES
 # ================================================================================================
 
-def create_amsr2_data_loaders(npz_dir: str, batch_size: int = 6,
-                              val_split: float = 0.2, num_workers: int = 15,  # Оптимизировано для 30 ядер
-                              filter_orbit_type: Optional[str] = None) -> tuple:
-    """Создание data loaders для NPZ файлов AMSR2 с CPU оптимизацией"""
+# In amsr2_super_resolution_complete.py, find and REPLACE the entire create_amsr2_data_loaders function:
 
-    # Поиск всех NPZ файлов
+def create_amsr2_data_loaders(npz_dir: str, batch_size: int = 8,
+                              val_split: float = 0.2, num_workers: int = 4,
+                              filter_orbit_type: Optional[str] = None) -> tuple:
+    """Create optimized data loaders for GPU/CPU training"""
+
+    # Find NPZ files
     npz_pattern = os.path.join(npz_dir, "*.npz")
     npz_files = glob.glob(npz_pattern)
 
     if not npz_files:
-        raise ValueError(f"Не найдено NPZ файлов в {npz_dir}")
+        raise ValueError(f"No NPZ files found in {npz_dir}")
 
-    logger.info(f"Найдено {len(npz_files)} NPZ файлов")
+    logger.info(f"Found {len(npz_files)} NPZ files")
 
-    # Разделение на train/val
+    # Split train/val
     split_idx = int(len(npz_files) * (1 - val_split))
     train_files = npz_files[:split_idx]
     val_files = npz_files[split_idx:]
@@ -1004,11 +1055,13 @@ def create_amsr2_data_loaders(npz_dir: str, batch_size: int = 6,
     logger.info(f"Train files: {len(train_files)}")
     logger.info(f"Val files: {len(val_files)}")
 
-    # Создание preprocessor с анализом данных
+    # Create preprocessor
     preprocessor = AMSR2NPZDataPreprocessor()
-    analysis = preprocessor.analyze_npz_files(npz_files[:5])  # Анализируем первые 5 файлов
 
-    # Создание datasets
+    # Quick analysis on a few files to determine target size
+    analysis = preprocessor.analyze_npz_files(npz_files[:min(5, len(npz_files))])
+
+    # Create datasets with memory-efficient loading
     train_dataset = AMSR2NPZDataset(
         npz_paths=train_files,
         preprocessor=preprocessor,
@@ -1025,33 +1078,55 @@ def create_amsr2_data_loaders(npz_dir: str, batch_size: int = 6,
         filter_orbit_type=filter_orbit_type
     )
 
-    # Ограничение workers для стабильности системы
-    effective_workers = min(num_workers, 15)  # Максимум 15 workers
+    # Check if GPU is available
+    use_gpu = torch.cuda.is_available()
 
-    logger.info(f"🔧 DataLoader настройки:")
-    logger.info(f"   Workers: {effective_workers} (ограничено для стабильности)")
-    logger.info(f"   Batch size: {batch_size}")
-    logger.info(f"   Pin memory: False (CPU mode)")
+    # Optimize DataLoader settings
+    if use_gpu:
+        # GPU optimizations
+        logger.info("🔧 Using GPU-optimized DataLoader settings")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,  # Important for GPU
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None,
+            drop_last=True
+        )
 
-    # Создание data loaders с CPU оптимизацией
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=effective_workers,
-        pin_memory=False,  # Отключено для CPU
-        drop_last=True,
-        persistent_workers=True  # Эффективность для длительного обучения
-    )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size * 2,  # Can use larger batch for validation
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+    else:
+        # CPU settings (from original)
+        logger.info("🔧 Using CPU-optimized DataLoader settings")
+        effective_workers = min(num_workers, 15)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=effective_workers,
+            pin_memory=False,
+            drop_last=True,
+            persistent_workers=True if effective_workers > 0 else False
+        )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=effective_workers,
-        pin_memory=False,  # Отключено для CPU
-        persistent_workers=True
-    )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=effective_workers,
+            pin_memory=False,
+            persistent_workers=True if effective_workers > 0 else False
+        )
 
     return train_loader, val_loader, preprocessor, analysis
 
@@ -1314,7 +1389,7 @@ def main():
     # Основные параметры
     parser.add_argument('--npz-dir', type=str, default='./npz_data',
                         help='Путь к папке с NPZ файлами')
-    parser.add_argument('--batch-size', type=int, default=6,
+    parser.add_argument('--batch-size', type=int, default=4,
                         help='Размер batch (оптимизировано для 30 ядер)')
     parser.add_argument('--epochs', type=int, default=50,
                         help='Количество эпох')
@@ -1403,7 +1478,7 @@ def main():
             npz_dir=NPZ_DIR,
             batch_size=BATCH_SIZE,
             val_split=args.val_split,
-            num_workers=max_workers,  # Используем ограниченное количество workers
+            num_workers=4 if DEVICE.type == 'cuda' else args.cpu_workers,  # Use 4 workers for GPU
             filter_orbit_type=args.orbit_filter
         )
 
@@ -1445,12 +1520,23 @@ def main():
     logger.info(f"   Размер модели: {model_size_mb:.1f} MB")
     logger.info(f"   Scale factor: {SCALE_FACTOR}x")
 
-    # Создание тренера
+    # Создание тренера with GPU optimizations
+    gradient_accumulation = 4 if DEVICE.type == 'cuda' else 1
+    use_amp = DEVICE.type == 'cuda'  # Only use AMP on GPU
+
     trainer = AMSR2SuperResolutionTrainer(
         model=model,
         device=DEVICE,
-        learning_rate=LEARNING_RATE
+        learning_rate=LEARNING_RATE,
+        gradient_accumulation_steps=gradient_accumulation,
+        use_amp=use_amp
     )
+
+    if DEVICE.type == 'cuda':
+        logger.info(f"🚀 GPU optimizations enabled:")
+        logger.info(f"   Mixed precision (AMP): {use_amp}")
+        logger.info(f"   Gradient accumulation: {gradient_accumulation} steps")
+        logger.info(f"   Effective batch size: {BATCH_SIZE * gradient_accumulation}")
 
     # Информация о старте обучения
     logger.info(f"🚀 Начинаем обучение:")
