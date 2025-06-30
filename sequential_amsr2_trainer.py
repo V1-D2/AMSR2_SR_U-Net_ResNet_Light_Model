@@ -1215,7 +1215,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("\n⏹️ Обучение прервано пользователем")
     except MemoryError as e:
-        logger.critical(f"\n💾 Критическая ошибка памяти: {e}")
+        logger.critical(f"\n💾Критическая ошибка памяти: {e}")
     except Exception as e:
         logger.error(f"\n❌ Неожиданная ошибка: {e}")
         import traceback
